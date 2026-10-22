@@ -1,0 +1,49 @@
+#include "Foveation.h"
+#include "Log.h"
+#include <d3dcompiler.h>
+#include <d3d11_4.h>
+#include <wrl/client.h>
+#include <cstdio>
+#include <fstream>
+using Microsoft::WRL::ComPtr;
+unsigned checks{};
+void Require(bool value,const char* label){++checks;if(!value){printf("FAIL: %s\n",label);ExitProcess(1);}}
+ComPtr<ID3DBlob> Compile(const char* code,const char* profile){ComPtr<ID3DBlob> blob,error;auto hr=D3DCompile(code,strlen(code),nullptr,nullptr,nullptr,"main",profile,0,0,&blob,&error);if(error)printf("%s",(char*)error->GetBufferPointer());Require(SUCCEEDED(hr),profile);return blob;}
+int wmain(int argc,wchar_t** argv){
+    Require(argc==2,"private output directory");std::filesystem::path root=std::filesystem::absolute(argv[1]);std::filesystem::create_directories(root);modulePath=root/L"test.exe";std::ofstream(root/L"AvalonVR.ini")<<"[Performance]\nFixedFoveation=0\nHiddenAreaMask=0\nNativeVrsPasses=0\nFoveationRadiusPercent=40\nFoveationStrength=2\nHiddenAreaMarginPixels=32\n";
+    HWND window=CreateWindowExW(0,L"STATIC",L"AvalonVR private GPU validation",WS_OVERLAPPED,0,0,256,256,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);Require(window!=nullptr,"hidden validation window");DXGI_SWAP_CHAIN_DESC sd{};sd.BufferDesc.Width=sd.BufferDesc.Height=256;sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;sd.SampleDesc.Count=1;sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;sd.BufferCount=2;sd.OutputWindow=window;sd.Windowed=TRUE;sd.SwapEffect=DXGI_SWAP_EFFECT_DISCARD;ComPtr<IDXGISwapChain> swap;
+    ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;D3D_FEATURE_LEVEL feature{};Require(SUCCEEDED(D3D11CreateDeviceAndSwapChain(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&sd,&swap,&device,&feature,&context)),"hardware device");ComPtr<ID3D11Multithread> multithread;Require(SUCCEEDED(context.As(&multithread)),"protected context interface");multithread->SetMultithreadProtected(TRUE);swap->Present(0,0);Require(foveation::Initialize(device.Get(),context.Get(),root/L"AvalonVR.ini"),"NVAPI VRS supported");
+    auto vs=Compile("float4 main(uint id:SV_VertexID):SV_Position{float2 uv=float2((id<<1)&2,id&2);return float4(uv*float2(2,-2)+float2(-1,1),0.5,1);}","vs_5_0");
+    auto ps=Compile("struct O{float4 a:SV_Target0;float4 b:SV_Target1;float4 c:SV_Target2;};O main(float4 p:SV_Position){O o;o.a=float4(frac(floor(p.x)/16),frac(floor(p.y)/16),0.5,1);o.b=o.c=o.a;return o;}","ps_5_0");ComPtr<ID3D11VertexShader> vertex;ComPtr<ID3D11PixelShader> pixel;Require(SUCCEEDED(device->CreateVertexShader(vs->GetBufferPointer(),vs->GetBufferSize(),nullptr,&vertex)),"vertex shader");Require(SUCCEEDED(device->CreatePixelShader(ps->GetBufferPointer(),ps->GetBufferSize(),nullptr,&pixel)),"pixel shader");foveation::RegisterShader(pixel.Get(),ps->GetBufferPointer(),ps->GetBufferSize(),0);
+    ComPtr<ID3D11Texture2D> targets[3],read;ComPtr<ID3D11RenderTargetView> views[3];D3D11_TEXTURE2D_DESC td{};td.Width=td.Height=256;td.MipLevels=td.ArraySize=td.SampleDesc.Count=1;td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;td.BindFlags=D3D11_BIND_RENDER_TARGET;
+    for(int i=0;i<3;++i){Require(SUCCEEDED(device->CreateTexture2D(&td,nullptr,&targets[i]))&&SUCCEEDED(device->CreateRenderTargetView(targets[i].Get(),nullptr,&views[i])),"GBuffer target");}td.BindFlags=0;td.Usage=D3D11_USAGE_STAGING;td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;Require(SUCCEEDED(device->CreateTexture2D(&td,nullptr,&read)),"test-only readback");
+    context->VSSetShader(vertex.Get(),nullptr,0);context->PSSetShader(pixel.Get(),nullptr,0);context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);D3D11_VIEWPORT viewport{0,0,256,256,0,1};context->RSSetViewports(1,&viewport);ID3D11RenderTargetView* raw[]={views[0].Get(),views[1].Get(),views[2].Get()};context->OMSetRenderTargets(3,raw,nullptr);
+    auto Read=[&](){context->CopyResource(read.Get(),targets[0].Get());D3D11_MAPPED_SUBRESOURCE mapped{};Require(SUCCEEDED(context->Map(read.Get(),0,D3D11_MAP_READ,0,&mapped)),"test completion");std::vector<uint32_t> pixels(256*256);for(int y=0;y<256;++y)memcpy(pixels.data()+y*256,(char*)mapped.pData+y*mapped.RowPitch,1024);context->Unmap(read.Get(),0);return pixels;};
+    D3D11_RASTERIZER_DESC rsd{};rsd.FillMode=D3D11_FILL_SOLID;rsd.CullMode=D3D11_CULL_NONE;rsd.DepthClipEnable=true;rsd.MultisampleEnable=false;ComPtr<ID3D11RasterizerState> raster;Require(SUCCEEDED(device->CreateRasterizerState(&rsd,&raster)),"test rasterizer state");context->RSSetState(raster.Get());
+    context->Draw(3,0);auto baseline=Read();Require(baseline[128*256+128]!=0,"baseline full-screen draw visible");
+    foveation::Frame frame{256,256,256,256,1,{{-.785398f,.785398f,.785398f,-.785398f},{-.785398f,.785398f,.785398f,-.785398f}}};foveation::BeginFrame(frame);
+    {foveation::Command scope(context.Get(),true,true);Require(scope.applied,"coarse GBuffer draw applied");context->Draw(3,0);}
+    {foveation::Command scope(context.Get(),true,true);Require(scope.applied,"compatible draw stays in VRS batch");context->Draw(3,0);}
+    {foveation::Command nested(context.Get(),false,false,false);Require(!nested.applied,"runtime forwarding does not alter outer command state");}
+    foveation::EndFrame();auto coarse=Read();Require(coarse[128*256+128]==baseline[128*256+128],"central pixel remains exact");unsigned changed{};for(size_t i=0;i<coarse.size();++i)changed+=coarse[i]!=baseline[i];printf("coarse changed=%u center=%08x edge base=%08x coarse=%08x neighbor=%08x/%08x\n",changed,baseline[128*256+128],baseline[16*256+16],coarse[16*256+16],baseline[16*256+17],coarse[16*256+17]);
+    context->Draw(3,0);Require(Read()==baseline,"native full rate restored after scope");
+    foveation::BeginFrame(frame);{foveation::Command command(context.Get(),true,true);Require(command.applied,"start batch before UI transition");context->Draw(3,0);}
+    {foveation::Command command(context.Get(),false,false);Require(!command.applied,"incompatible command restores full rate");context->Draw(3,0);}Require(Read()==baseline,"full-rate UI after active VRS batch");
+    {foveation::Command command(context.Get(),true,true);Require(command.applied,"restart batch after UI");context->Draw(3,0);}
+    viewport.Width=128;context->RSSetViewports(1,&viewport);{foveation::Command command(context.Get(),true,true);Require(!command.applied,"unknown viewport restores native state");}viewport.Width=256;context->RSSetViewports(1,&viewport);context->Draw(3,0);Require(Read()==baseline,"unknown-size transition did not retain VRS");foveation::EndFrame();
+    {foveation::Command scope(context.Get(),false,true);Require(!scope.applied,"UI/outside-scene bypass");}
+    vrsmask::Mesh meshes[2];for(auto& m:meshes)m={{{-.6f,-.6f},{.6f,-.6f},{.6f,.6f},{-.6f,.6f}},{0,1,2,0,2,3},true};foveation::SetVisibility(meshes);frame.flags=2;foveation::BeginFrame(frame);float black[4]{};for(auto& v:views)context->ClearRenderTargetView(v.Get(),black);
+    {foveation::Command scope(context.Get(),true,false);Require(scope.applied,"hidden-area scope applied");context->Draw(3,0);}foveation::EndFrame();auto masked=Read();printf("hidden corner=%08x center=%08x expectedCenter=%08x\n",masked[4*256+4],masked[128*256+128],baseline[128*256+128]);Require(masked[4*256+4]==0&&masked[128*256+128]==baseline[128*256+128],"hidden output culled; visible center retained");
+    context->Draw(3,0);Require(Read()==baseline,"hidden mask reset before native draw");
+    ComPtr<ID3D11Texture2D> depth;ComPtr<ID3D11DepthStencilView> dsv;td.Usage=D3D11_USAGE_DEFAULT;td.CPUAccessFlags=0;td.BindFlags=D3D11_BIND_DEPTH_STENCIL;td.Format=DXGI_FORMAT_D32_FLOAT;Require(SUCCEEDED(device->CreateTexture2D(&td,nullptr,&depth))&&SUCCEEDED(device->CreateDepthStencilView(depth.Get(),nullptr,&dsv)),"native writable depth");context->OMSetRenderTargets(3,raw,dsv.Get());{foveation::Command scope(context.Get(),true,true);Require(!scope.applied,"writable depth excludes hidden-area culling");}
+    frame.flags=3;foveation::BeginFrame(frame);{foveation::Command scope(context.Get(),true,true);Require(scope.applied,"coarse-only shading preserves writable depth coverage");}
+    context->OMSetRenderTargets(3,raw,nullptr);ComPtr<ID3D11DeviceContext> deferred;Require(SUCCEEDED(device->CreateDeferredContext(0,&deferred)),"deferred context");{foveation::Command scope(deferred.Get(),true,true);Require(!scope.applied,"no deferred NVAPI state");}
+    foveation::EndFrame();{foveation::Command scope(context.Get(),true,true);Require(!scope.applied,"end-of-scene reset");}
+    frame.flags=1;foveation::BeginFrame(frame);foveation::BeginNativePass();context->Draw(3,0);foveation::EndNativePass();Require(Read()==coarse,"native pass batching produces identical coarse shading");context->Draw(3,0);Require(Read()==baseline,"native pass end restores full rate");
+    frame.flags=2;foveation::BeginFrame(frame);for(auto& v:views)context->ClearRenderTargetView(v.Get(),black);foveation::BeginNativePass();context->Draw(3,0);foveation::EndNativePass();Require(Read()==masked,"native pass hidden mask matches guarded command implementation");
+    context->OMSetRenderTargets(1,raw,nullptr);foveation::BeginNativePass();context->Draw(3,0);foveation::EndNativePass();Require(Read()==baseline,"native pass refuses non-GBuffer target sets");context->OMSetRenderTargets(3,raw,dsv.Get());context->ClearDepthStencilView(dsv.Get(),D3D11_CLEAR_DEPTH,1,0);foveation::BeginNativePass();context->Draw(3,0);foveation::EndNativePass();Require(Read()==baseline,"whole native pass refuses hidden culling with writable depth view");
+    context->OMSetRenderTargets(3,raw,nullptr);foveation::EndFrame();foveation::Report();Require(changed>100,"peripheral hardware coarse shading changes actual output");Require(SUCCEEDED(device->GetDeviceRemovedReason()),"device healthy");printf("PASS: %u real NVAPI GPU checks; central/full-rate reset, peripheral coarse shading, hidden mask and depth/UI/deferred guards.\n",checks);
+}
+
+
+

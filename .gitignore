@@ -1,0 +1,11 @@
+/build*/
+/dist/
+/shader-hunter/
+*.log
+*.bmp
+*.png
+*.dmp
+*.pdb
+*.present
+*.user
+.vs/
